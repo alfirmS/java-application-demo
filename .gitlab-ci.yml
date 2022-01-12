@@ -21,6 +21,6 @@ Push Docker Image to Gitlab Registry:
   tags:
     - docker
   before_script:
-    - docker login registry.gitlab.com -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_TOKEN"
+    - docker login registry.gitlab.com -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
   script:
     - docker push registry.gitlab.com/sfirman87/java-tomcat
