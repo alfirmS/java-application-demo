@@ -8,7 +8,7 @@ build-java-project:
   tags:
       - docker
   script:
-  - mvn package
+  - mvn clean package
 
 build-docker-image:
   stage: build-docker-image
