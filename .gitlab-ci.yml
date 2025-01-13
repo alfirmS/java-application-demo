@@ -15,7 +15,7 @@ build-docker-image:
   tags:
     - docker
   script:
-    - docker build -t registry.gitlab.com/sfirman87/java-tomcat .
+    - docker build -t registry.gitlab.com/sfirman87/java-application:v1.0 .
 Push Docker Image to Gitlab Registry:
   stage: push-image-to-gitlab-reg
   tags:
@@ -23,4 +23,4 @@ Push Docker Image to Gitlab Registry:
   before_script:
     - docker login registry.gitlab.com -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
   script:
-    - docker push registry.gitlab.com/sfirman87/java-tomcat
+    - docker push registry.gitlab.com/sfirman87/java-application:v1.0
