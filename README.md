@@ -4,7 +4,7 @@ This is a web application in Java with Apache Tomcat embedded to the JAR (not WA
 
 # Running the application
 ```
-git clone https://github.com/julianjupiter/java-web-app-with-embedded-tomcat
+git clone git@github.com:alfirmS/java-application-demo.git
 cd java-web-app-with-embedded-tomcat
 mvn clean package && java -jar ./target/java-web-app-with-embedded-tomcat-1.0.0-SNAPSHOT.jar
 ```
