@@ -1,26 +1,99 @@
 stages:
-  - build
   - build-docker-image
+  - sast-testing
   - push-image-to-gitlab-reg
 
+variables:
+  SSC_URL: 'http://192.168.100.178:8080/ssc'
+  SSC_AUTH_TOKEN: '4d42f5ef-eaf9-4984-b701-dff5b5bcc094'
+  VERSION_MAJOR: '1'
+  VERSION_MINOR: '0'
+  VERSION_PATCH: '0'
+  BUILD_TIMESTAMP: '$(date +%Y%m%d%)'
+  PROJECT_VERSION: '${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}-${BUILD_TIMESTAMP}'
+  FCLI_PATH: '/opt/Fortify/fcli/bin/fcli'
+  SCANCENTRAL_EXECUTABLE: '/opt/Fortify/ScanCentral/bin/scancentral'
+  CLIENT_AUTH_TOKEN: '4d42f5ef-eaf9-4984-b701-dff5b5bcc094'
+  SSC_PASS: 'snd2access!'
+  CRITICAL_THRESHOLD: 20
+  MEDIUM_THRESHOLD: 50
+  LOW_THRESHOLD: 30
+
 build-java-project:
-  stage: build
-  tags:
-      - docker
+  stage: build-docker-image
   script:
   - mvn clean package
+  - docker build -t index.docker.io/sfirman87/java-application:${PROJECT_VERSION} .
 
-build-docker-image:
-  stage: build-docker-image
-  tags:
-    - docker
-  script:
-    - docker build -t registry.gitlab.com/sfirman87/java-application:v1.0 .
-Push Docker Image to Gitlab Registry:
-  stage: push-image-to-gitlab-reg
-  tags:
-    - docker
+sast-testing:
+  stage: sast-testing
+  image: rdman/fortify-modify
   before_script:
-    - docker login registry.gitlab.com -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+    - echo "Logging in to Fortify SSC using fcli..."
+    - ${FCLI_PATH} ssc session login --url ${SSC_URL} --token=${SSC_AUTH_TOKEN}
+    - ${FCLI_PATH} sc-sast session login --client-auth-token=${CLIENT_AUTH_TOKEN} --log-file=login.log --log-level=DEBUG --to-file=stdout_ --ssc-url=${SSC_URL} -u=admin -p=${SSC_PASS}
+    - ${SCANCENTRAL_EXECUTABLE} package -bt mvn -o java-application.zip
+    - ${FCLI_PATH} sc-sast scan start -v='${PROJECT_VERSION}' -p="java-application.zip" --publish-to=10004 --ssc-ci-token=${SSC_AUTH_TOKEN} --log-file=sidaut.log --log-level=ERROR > scan_output
   script:
-    - docker push registry.gitlab.com/sfirman87/java-application:v1.0
+    - fcli ssc artifact download \
+        --ssc-url ${SSC_URL} \
+        --auth-token ${SSC_AUTH_TOKEN} \
+        --project "java-application" \
+        --version "${PROJECT_VERSION}" \
+        --file latest.fpr
+
+analyze_fpr:
+  stage: analyze
+  image: rdman/fortify-modify
+  script:
+    - fcli fpr query \
+        --file latest.fpr \
+        --query "[fortify priority order]:critical" > critical.txt
+    - fcli fpr query \
+        --file latest.fpr \
+        --query "[fortify priority order]:medium" > medium.txt
+    - fcli fpr query \
+        --file latest.fpr \
+        --query "[fortify priority order]:low" > low.txt
+
+    # Hitung jumlah masalah berdasarkan tingkat keparahan
+    - CRITICAL_COUNT=$(wc -l < critical.txt)
+    - MEDIUM_COUNT=$(wc -l < medium.txt)
+    - LOW_COUNT=$(wc -l < low.txt)
+    - TOTAL_COUNT=$((CRITICAL_COUNT + MEDIUM_COUNT + LOW_COUNT))
+
+    # Periksa jika tidak ada masalah
+    - |
+      if [ "$TOTAL_COUNT" -eq 0 ]; then
+        echo "No issues found."
+        exit 0
+      fi
+
+    # Hitung persentase
+    - CRITICAL_PERCENT=$((CRITICAL_COUNT * 100 / TOTAL_COUNT))
+    - MEDIUM_PERCENT=$((MEDIUM_COUNT * 100 / TOTAL_COUNT))
+    - LOW_PERCENT=$((LOW_COUNT * 100 / TOTAL_COUNT))
+
+    - echo "Critical: $CRITICAL_PERCENT%, Medium: $MEDIUM_PERCENT%, Low: $LOW_PERCENT%"
+
+    # Tampilkan dan validasi terhadap threshold
+    - |
+      if [ "$CRITICAL_PERCENT" -gt "$CRITICAL_THRESHOLD" ]; then
+        echo "Critical issues exceed threshold ($CRITICAL_PERCENT% > $CRITICAL_THRESHOLD%)"
+        exit 1
+      fi
+      if [ "$MEDIUM_PERCENT" -gt "$MEDIUM_THRESHOLD" ]; then
+        echo "Medium issues exceed threshold ($MEDIUM_PERCENT% > $MEDIUM_THRESHOLD%)"
+        exit 1
+      fi
+      if [ "$LOW_PERCENT" -gt "$LOW_THRESHOLD" ]; then
+        echo "Low issues exceed threshold ($LOW_PERCENT% > $LOW_THRESHOLD%)"
+        exit 1
+      fi
+
+Push Docker Image to Registry:
+  stage: push-image-to-gitlab-reg
+  before_script:
+    - docker login index.docker.io -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+  script:
+    - docker push index.docker.io/sfirman87/java-application:${PROJECT_VERSION}
