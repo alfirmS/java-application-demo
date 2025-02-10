@@ -1,99 +1,151 @@
 stages:
-  - build-docker-image
   - sast-testing
-  - push-image-to-gitlab-reg
-
+  - get_result
+  - build-docker-image
+  #- push-image-to-gitlab-reg
+  - deploy
+  - dast-testing
 variables:
   SSC_URL: 'http://192.168.100.178:8080/ssc'
   SSC_AUTH_TOKEN: '4d42f5ef-eaf9-4984-b701-dff5b5bcc094'
   VERSION_MAJOR: '1'
-  VERSION_MINOR: '0'
+  VERSION_MINOR: '2'
   VERSION_PATCH: '0'
-  BUILD_TIMESTAMP: '$(date +%Y%m%d%)'
-  PROJECT_VERSION: '${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}-${BUILD_TIMESTAMP}'
+  APPLICATION_NAME: 'java-application'
+  BUILD_TIMESTAMP: $(date +'%Y%m%d%H%M%S')
+  PROJECT_VERSION: '${VERSION_MAJOR}.${VERSION_MINOR}'
   FCLI_PATH: '/opt/Fortify/fcli/bin/fcli'
   SCANCENTRAL_EXECUTABLE: '/opt/Fortify/ScanCentral/bin/scancentral'
   CLIENT_AUTH_TOKEN: '4d42f5ef-eaf9-4984-b701-dff5b5bcc094'
   SSC_PASS: 'snd2access!'
-  CRITICAL_THRESHOLD: 20
-  MEDIUM_THRESHOLD: 50
-  LOW_THRESHOLD: 30
-
-build-java-project:
-  stage: build-docker-image
-  script:
-  - mvn clean package
-  - docker build -t index.docker.io/sfirman87/java-application:${PROJECT_VERSION} .
-
+  CONTROLLER_URL: 'http://192.168.100.178:8280/scancentral-ctrl'
+  CLIENT_PROPERTIES_FILE: "/opt/Fortify/ScanCentral/Core/config/client.properties"
+  API_RESULT: ${SSC_URL}api/v1/projectVersions/
+  # Max Vuln
+  MAX_CRITICAL_PCT: 100
+  MAX_HIGH_PCT: 100
+  MAX_MEDIUM_PCT: 100
+  MAX_LOW_PCT: 100
+  DOCKER_IMAGE: registry.gitlab.com/sfirman87/java-application
+  CONTAINER_NAME_OLD: java-application-v${PROJECT_VERSION}
+  CONTAINER_NAME_NEW: java-application-v${PROJECT_VERSION}
+  PROJECT_PORT: 8080
+  DEPLOY_PORT: 8189
+  DOCKER_DRIVER: overlay2
+#test
 sast-testing:
   stage: sast-testing
+  cache: {}
   image: rdman/fortify-modify
-  before_script:
+  script:
+    - 'echo client_auth_token=${CLIENT_AUTH_TOKEN} > /opt/Fortify/ScanCentral/Core/config/client.properties'
     - echo "Logging in to Fortify SSC using fcli..."
     - ${FCLI_PATH} ssc session login --url ${SSC_URL} --token=${SSC_AUTH_TOKEN}
-    - ${FCLI_PATH} sc-sast session login --client-auth-token=${CLIENT_AUTH_TOKEN} --log-file=login.log --log-level=DEBUG --to-file=stdout_ --ssc-url=${SSC_URL} -u=admin -p=${SSC_PASS}
-    - ${SCANCENTRAL_EXECUTABLE} package -bt mvn -o java-application.zip
-    - ${FCLI_PATH} sc-sast scan start -v='${PROJECT_VERSION}' -p="java-application.zip" --publish-to=10004 --ssc-ci-token=${SSC_AUTH_TOKEN} --log-file=sidaut.log --log-level=ERROR > scan_output
+    - ${FCLI_PATH} sc-sast session login -c=${CLIENT_AUTH_TOKEN} --log-file=login.log --log-level=DEBUG --to-file=stdout_ --ssc-url=${SSC_URL} -u=sholeh -p="@SFirman889"
+    - ${FCLI_PATH} ssc appversion create ${APPLICATION_NAME}:${PROJECT_VERSION} -d "This is a service ${APPLICATION_NAME}" --auto-required-attrs --skip-if-exists --issue-template "Prioritized High Risk Issue Template"
+    - ${SCANCENTRAL_EXECUTABLE} -url ${CONTROLLER_URL} start -bt mvn -upload -application "${APPLICATION_NAME}" -version "${PROJECT_VERSION}" -uptoken ${SSC_AUTH_TOKEN} -log-file ${APPLICATION_NAME}.log
+    - ${SCANCENTRAL_EXECUTABLE} package -bt mvn -o ${APPLICATION_NAME}.zip
+    - echo "Send request for scan and wait the job"
+    - fcli sc-sast session login --client-auth-token=${CLIENT_AUTH_TOKEN} --ssc-url=http://192.168.100.178:8080/ssc -u=admin -p=snd2access!
+    - echo ${PROJECT_VERSION}
+    - ${FCLI_PATH} sc-sast scan start -v=${PROJECT_VERSION} -p="${APPLICATION_NAME}.zip" --publish-to=${APPLICATION_NAME}:${PROJECT_VERSION} --ssc-ci-token=${SSC_AUTH_TOKEN} --log-file=${APPLICATION_NAME}.log --log-level=ERROR --store job > scan_output
+    #- fcli sc-sast scan wait-for ::job::jobToken
+    - fcli ssc issue count --av="${APPLICATION_NAME}:${PROJECT_VERSION}" -o json > issues.json
+  artifacts:
+    paths:
+      - issues.json
+get_result:
+  stage: get_result
+  dependencies:
+    - sast-testing
+  image: fortifydocker/fortify-ci-tools:latest
+  before_script:
+    - echo "Installing jq..."
+    - apt-get update && apt-get install -y jq
+    - cp issues.json report.json
   script:
-    - fcli ssc artifact download \
-        --ssc-url ${SSC_URL} \
-        --auth-token ${SSC_AUTH_TOKEN} \
-        --project "java-application" \
-        --version "${PROJECT_VERSION}" \
-        --file latest.fpr
+    - |
+      set -ex
+      # Define function to fetch vulnerability count
+      get_vuln_count() {
+        jq --arg severity "$1" '[.[] | select(.id == $severity)] | .[].totalCount' report.json;
+      }
 
-analyze_fpr:
-  stage: analyze
+      # Fetch counts for each severity
+      CRITICAL_VULN=$(get_vuln_count Critical)
+      HIGH_VULN=$(get_vuln_count High)
+      MEDIUM_VULN=$(get_vuln_count Medium)
+      LOW_VULN=$(get_vuln_count Low)
+
+      # Calculate total vulnerabilities
+      TOTAL_VULN=$((CRITICAL_VULN + HIGH_VULN + MEDIUM_VULN + LOW_VULN))
+
+      # Calculate percentages
+      CRITICAL_PCT=$((CRITICAL_VULN * 100 / TOTAL_VULN))
+      HIGH_PCT=$((HIGH_VULN * 100 / TOTAL_VULN))
+      MEDIUM_PCT=$((MEDIUM_VULN * 100 / TOTAL_VULN))
+      LOW_PCT=$((LOW_VULN * 100 / TOTAL_VULN))
+
+      # Add info to report
+      echo "---------------------------------" >> report.json
+      echo "Scan Results - $(date "+%Y-%m-%d %H:%M:%S")" >> report.json
+      echo "Commit: ${CI_COMMIT_SHORT_SHA}" >> report.json
+      echo "---------------------------------" >> report.json
+
+      # Check if any severity exceeds its percentage threshold
+      if (( CRITICAL_PCT > MAX_CRITICAL_PCT || HIGH_PCT > MAX_HIGH_PCT || MEDIUM_PCT > MAX_MEDIUM_PCT || LOW_PCT > MAX_LOW_PCT )); then
+        echo "ERROR: One or more vulnerability percentages exceed the limit. Failing the job."
+        exit 1
+      fi
+  artifacts:
+    paths:
+      - report.json
+build-docker:
+  stage: build-docker-image
+  tags:
+    - shell-runner
+  script:
+    - docker --version
+    - echo ${BUILD_TIMESTAMP}
+    - docker build --no-cache -t registry.gitlab.com/sfirman87/java-application:${PROJECT_VERSION} .
+# Push Docker Image to Registry:
+#   stage: push-image-to-gitlab-reg
+#   cache: {}
+#   tags:
+#   - shell-runner
+#   script:
+#     - whoami
+#     - docker login registry.gitlab.com -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+#     - docker images
+#     - cat ~/.docker/config.json
+#     - docker push registry.gitlab.com/sfirman87/java-application:${PROJECT_VERSION}
+#   dependencies:
+#     - build-docker
+Deploy Application to Docker Container:
+  stage: deploy
+  tags:
+    - shell-runner
+  script:
+    - echo "Stopping old container (if any)..."
+    - docker ps -q --filter "name=${CONTAINER_NAME_OLD}" | grep -q . && docker stop ${CONTAINER_NAME_OLD} || echo "No old container running."
+    - echo "Removing old container (if any)..."
+    - docker ps -aq --filter "name=${CONTAINER_NAME_OLD}" | grep -q . && docker rm ${CONTAINER_NAME_OLD} || echo "No old container to remove."
+    - echo "Starting new container..."
+    - docker run -d --name ${CONTAINER_NAME_NEW} -p ${DEPLOY_PORT}:${PROJECT_PORT} ${DOCKER_IMAGE}:${PROJECT_VERSION}
+    - echo "Checking if the new container is running..."
+    - docker ps --filter "name=${CONTAINER_NAME_NEW}" --filter "status=running" | grep -q ${CONTAINER_NAME_NEW} || (echo "New container failed to start!" && exit 1)
+dast-testing:
+  stage: dast-testing
+  cache: {}
   image: rdman/fortify-modify
   script:
-    - fcli fpr query \
-        --file latest.fpr \
-        --query "[fortify priority order]:critical" > critical.txt
-    - fcli fpr query \
-        --file latest.fpr \
-        --query "[fortify priority order]:medium" > medium.txt
-    - fcli fpr query \
-        --file latest.fpr \
-        --query "[fortify priority order]:low" > low.txt
-
-    # Hitung jumlah masalah berdasarkan tingkat keparahan
-    - CRITICAL_COUNT=$(wc -l < critical.txt)
-    - MEDIUM_COUNT=$(wc -l < medium.txt)
-    - LOW_COUNT=$(wc -l < low.txt)
-    - TOTAL_COUNT=$((CRITICAL_COUNT + MEDIUM_COUNT + LOW_COUNT))
-
-    # Periksa jika tidak ada masalah
-    - |
-      if [ "$TOTAL_COUNT" -eq 0 ]; then
-        echo "No issues found."
-        exit 0
-      fi
-
-    # Hitung persentase
-    - CRITICAL_PERCENT=$((CRITICAL_COUNT * 100 / TOTAL_COUNT))
-    - MEDIUM_PERCENT=$((MEDIUM_COUNT * 100 / TOTAL_COUNT))
-    - LOW_PERCENT=$((LOW_COUNT * 100 / TOTAL_COUNT))
-
-    - echo "Critical: $CRITICAL_PERCENT%, Medium: $MEDIUM_PERCENT%, Low: $LOW_PERCENT%"
-
-    # Tampilkan dan validasi terhadap threshold
-    - |
-      if [ "$CRITICAL_PERCENT" -gt "$CRITICAL_THRESHOLD" ]; then
-        echo "Critical issues exceed threshold ($CRITICAL_PERCENT% > $CRITICAL_THRESHOLD%)"
-        exit 1
-      fi
-      if [ "$MEDIUM_PERCENT" -gt "$MEDIUM_THRESHOLD" ]; then
-        echo "Medium issues exceed threshold ($MEDIUM_PERCENT% > $MEDIUM_THRESHOLD%)"
-        exit 1
-      fi
-      if [ "$LOW_PERCENT" -gt "$LOW_THRESHOLD" ]; then
-        echo "Low issues exceed threshold ($LOW_PERCENT% > $LOW_THRESHOLD%)"
-        exit 1
-      fi
-
-Push Docker Image to Registry:
-  stage: push-image-to-gitlab-reg
-  before_script:
-    - docker login index.docker.io -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
-  script:
-    - docker push index.docker.io/sfirman87/java-application:${PROJECT_VERSION}
+    - 'echo client_auth_token=${CLIENT_AUTH_TOKEN} > /opt/Fortify/ScanCentral/Core/config/client.properties'
+    - echo "Logging in to Fortify SSC using fcli..."
+    - ${FCLI_PATH} ssc session login --url ${SSC_URL} --token=${SSC_AUTH_TOKEN}
+    - ${FCLI_PATH} sc-dast session login --ssc-url ${SSC_URL} -t ${SSC_AUTH_TOKEN}
+    - ${FCLI_PATH} sc-dast scan start -n ${APPLICATION_NAME} -s 1d71aaf4-bb37-4af7-b3e8-1fcbb5d89207 -p "All Checks" --store java
+    #- fcli sc-dast scan wait-for ::java::id
+    #- fcli sc-dast scan publish ::java::id
+  #artifacts:
+  #  paths:
+  #    - issues.json%
